@@ -1,0 +1,28 @@
+{
+  "C1": {
+    "best_agg": 162.68,
+    "median_agg": 152.16,
+    "ttft_ms": 115.2,
+    "peak_vram_mib": 95393,
+    "per_req_decode_best": [
+      175.61
+    ]
+  },
+  "C4": {
+    "best_agg": 410.89,
+    "median_agg": 384.66,
+    "ttft_ms": 231.4,
+    "peak_vram_mib": 95553,
+    "per_req_decode_best": [
+      113.32,
+      140.1,
+      113.05,
+      128.51
+    ]
+  },
+  "prefill_probe": {
+    "prompt_tokens": 2559,
+    "prefill_tok_s": 10149.7,
+    "ttft_ms": 252.1
+  }
+}

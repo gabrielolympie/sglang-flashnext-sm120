@@ -1,0 +1,114 @@
+{
+  "date": "2026-08-31",
+  "run": "8h autonomous optimization (Claude), final stable build via serve_best.sh",
+  "engine": "sglang-official branch sm120-wy @ 85e7da1 (qwen4-main-squashed + 6 local commits)",
+  "gpu": "RTX PRO 6000 Blackwell 96GB (sm120, 300W), mclk 13365MHz => ~1.71 TB/s",
+  "config": {
+    "MEMFRAC": 0.95,
+    "CTX": 131072,
+    "MAXREQ": 8,
+    "CUDAGRAPH_MAXBS": 8,
+    "MAMBA_CACHE": 48,
+    "KVDTYPE": "fp8_e4m3",
+    "LINEAR_BACKEND": "flashinfer",
+    "GDN_MTP_CACHE_MODE": "none",
+    "SGLANG_SM120_LOWM_FP8_WEIGHT": 1,
+    "SGLANG_SM120_LM_HEAD_FP8": 1,
+    "SPEC": "NEXTN 3 steps / 4 draft",
+    "SPEC_ACCEPT_SINGLE": 0.3,
+    "SPEC_ACCEPT_ACC": 0.3,
+    "SPEC_TOKEN_MAP": "hot_tokens_64k.pt (FR-Spec 64K subset)"
+  },
+  "results_temp06": {
+    "decode_C1_median": 231.0,
+    "decode_C1_best": 234.6,
+    "decode_C4_agg_median": 620.0,
+    "decode_C4_agg_best": 628.7,
+    "decode_C8_agg": 758.1,
+    "prefill_2p5k_tok_s": 10400,
+    "ttft_ms": 139,
+    "decode_16k_context_tok_s": 265,
+    "accept_len_range": [
+      2.4,
+      3.0
+    ]
+  },
+  "results_greedy_lossless": {
+    "decode_C1_median": 202.9,
+    "decode_C1_best": 205.0,
+    "decode_C4_agg_median": 549.2,
+    "accept_len_range": [
+      2.08,
+      2.22
+    ],
+    "note": "acceptance thresholds are exact-match no-ops at temp 0"
+  },
+  "baselines": {
+    "run_start_2026_08_30": {
+      "C1_greedy_median": 142.8,
+      "C1_temp06_median": 178.6,
+      "C4": 428,
+      "C8": "broken (487 < C4)"
+    },
+    "jpezzulli_published": {
+      "C1": 171,
+      "C4": 428
+    }
+  },
+  "gains": {
+    "C1_lossless": "+42%",
+    "C1_temp06": "+29% vs same-day baseline",
+    "C4": "+45%",
+    "vs_jpezzulli": "135% / 145%"
+  },
+  "quality_gates_final": "ALL PASS: greedy 17*23/Canberra, needles 250/123/377 in 7.3K prompt, cached-prefix identical, GSM 5/5 and 8/8 at temp 0.6, code spot, French",
+  "per_step_gpu_ms_final_profile": {
+    "total": 13.28,
+    "note": "under profiler; ~11 real. verify+draft+extend, 2309 kernels/step",
+    "fp8w_gemms": 3.43,
+    "nvfp4_moe": 3.21,
+    "hc": 1.64,
+    "moe_glue": 0.88,
+    "small_bf16_gemms": 0.86,
+    "gdn": 0.76,
+    "aten_misc": 0.76,
+    "qsa": 0.46,
+    "rest": 1.28
+  },
+  "ceiling_position": "~66% of the fp8-adjusted practical ceiling (~305 tok/s greedy ideal); was ~37% of the (obsolete) bf16 ceiling at run start",
+  "soak_test": {
+    "duration_min": 20,
+    "requests": 1933,
+    "tokens": 597244,
+    "errors": 0,
+    "sustained_mixed_load_tok_s": 498,
+    "vram_stable_mib": 96015,
+    "ram_stable_gb": 75,
+    "post_soak_bench": {
+      "C1": 235.3,
+      "C4": 618.1,
+      "note": "no degradation after 600K tokens"
+    }
+  },
+  "long_context": {
+    "ctx_default": 131072,
+    "kv_pool_tokens_fp8": 411200,
+    "needle_76k": "edges + most middles pass; item-specific middle misses reproduced with bf16 KV => model/QSA-inherent, not fp8",
+    "bench_at_128k_ctx": {
+      "C1": "224-235 median range",
+      "C4": 622.4,
+      "prefill_cached": 18064
+    }
+  },
+  "burn_in_60min": {
+    "requests": 5832,
+    "tokens": 1787025,
+    "errors": 0,
+    "sustained_tok_s": 497,
+    "post_burnin_bench": {
+      "C1": 223.3,
+      "C4": 608.3
+    },
+    "post_burnin_state": "VRAM 95.9GB flat, RAM 75GB flat, GPU cooled to 74C, health 200"
+  }
+}

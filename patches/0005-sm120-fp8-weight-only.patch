@@ -1,0 +1,315 @@
+From 284d7fe54dd399bda3be870fdeb37b510391e4a4 Mon Sep 17 00:00:00 2001
+From: gabrielolympie <gab.olympie@gmail.com>
+Date: Mon, 31 Aug 2026 01:20:04 +0200
+Subject: [PATCH 2/3] sm120: W8A16 fp8 weight-only serving for low-M dense
+ GEMMs
+
+Per-row-scaled float8_e4m3fn copies of eligible bf16 weights (>=4MB, cached by
+data_ptr+shape+version, populated during warmup so CUDA graph capture only
+sees cache hits), served by a (1,32,128) split-free Triton kernel at 89% of
+the halved-bytes floor. Split-K tactics dropped everywhere: the
+zero+atomic+cast epilogue measured worse than split-free on every real shape.
+
+C1 greedy median 147.9 -> 163.5 tok/s, C4 428 -> 477 median / 484 best
+(mem-fraction 0.96 to hold ~3GB of fp8 copies; greedy/needles/gsm/cached-
+prefix gates all pass, accept length unchanged).
+Env: SGLANG_SM120_LOWM_FP8_WEIGHT (default off).
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ .../kernels/ops/gemm/sm120_lowm_bf16_gemm.py  | 211 +++++++++++++-----
+ python/sglang/srt/environ.py                  |   4 +
+ .../sglang/srt/layers/quantization/unquant.py |   7 +-
+ 3 files changed, 169 insertions(+), 53 deletions(-)
+
+diff --git a/python/sglang/kernels/ops/gemm/sm120_lowm_bf16_gemm.py b/python/sglang/kernels/ops/gemm/sm120_lowm_bf16_gemm.py
+index 9441dd9..c27cda2 100644
+--- a/python/sglang/kernels/ops/gemm/sm120_lowm_bf16_gemm.py
++++ b/python/sglang/kernels/ops/gemm/sm120_lowm_bf16_gemm.py
+@@ -35,6 +35,9 @@ _MIN_WEIGHT_BYTES = 512 * 1024  # below this, launch overhead dominates; keep cu
+ # Above this, cuBLAS GEMV/split-K already streams at ~94% of DRAM bandwidth
+ # (measured on the 1.27 GB lm_head); keep it.
+ _MAX_WEIGHT_BYTES = 128 * 1024 * 1024
++# Below this the fp8 byte saving no longer covers the conversion overhead and
++# the extra VRAM for the fp8 copy buys little.
++_FP8_MIN_WEIGHT_BYTES = 4 * 1024 * 1024
+ 
+ 
+ @triton.jit
+@@ -97,77 +100,181 @@ def _sm120_lowm_gemm_kernel(
+         )
+ 
+ 
++@triton.jit
++def _sm120_lowm_gemm_fp8w_kernel(
++    x_ptr,
++    w_ptr,
++    scale_ptr,
++    out_ptr,
++    M,
++    N,
++    K,
++    stride_xm,
++    stride_xk,
++    stride_wn,
++    stride_wk,
++    stride_om,
++    stride_on,
++    BLOCK_N: tl.constexpr,
++    BLOCK_K: tl.constexpr,
++    BLOCK_M: tl.constexpr,
++    SPLIT_K: tl.constexpr,
++    NUM_STAGES: tl.constexpr,
++    OUT_BF16: tl.constexpr,
++):
++    """Weight-only FP8: w is float8_e4m3fn with per-output-row fp32 scales."""
++    pid_n = tl.program_id(0)
++    pid_k = tl.program_id(1)
++    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
++    rm = tl.arange(0, BLOCK_M)
++    n_mask = rn < N
++    m_mask = rm < M
++    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
++    k_per = tl.cdiv(K, SPLIT_K)
++    k_start = pid_k * k_per
++    k_end = tl.minimum(k_start + k_per, K)
++    for k0 in tl.range(k_start, k_end, BLOCK_K, num_stages=NUM_STAGES):
++        rk = k0 + tl.arange(0, BLOCK_K)
++        k_mask = rk < k_end
++        xb = tl.load(
++            x_ptr + rm[:, None] * stride_xm + rk[None, :] * stride_xk,
++            mask=m_mask[:, None] & k_mask[None, :],
++            other=0.0,
++        )
++        wb = tl.load(
++            w_ptr + rn[:, None] * stride_wn + rk[None, :] * stride_wk,
++            mask=n_mask[:, None] & k_mask[None, :],
++            other=0.0,
++        ).to(tl.bfloat16)
++        acc += tl.dot(xb, tl.trans(wb), out_dtype=tl.float32)
++    scale = tl.load(scale_ptr + rn, mask=n_mask, other=0.0)
++    acc = acc * scale[None, :]
++    if OUT_BF16:
++        tl.store(
++            out_ptr + rm[:, None] * stride_om + rn[None, :] * stride_on,
++            acc.to(tl.bfloat16),
++            mask=m_mask[:, None] & n_mask[None, :],
++        )
++    else:
++        tl.atomic_add(
++            out_ptr + rm[:, None] * stride_om + rn[None, :] * stride_on,
++            acc,
++            mask=m_mask[:, None] & n_mask[None, :],
++            sem="relaxed",
++        )
++
++
++# fp8 weight-only cache: weight data_ptr -> (fp8 weight, per-row fp32 scale).
++# Populated during eager warmup (before CUDA graph capture); a miss during
++# capture falls back to the bf16 kernel so no allocation lands in the graph.
++_fp8w_cache: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
++_fp8w_cache_bytes = 0
++_FP8W_CACHE_MAX_BYTES = 6 * 1024**3
++
++
++def _quantize_rowwise_fp8(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
++    amax = w.abs().amax(dim=1, keepdim=True).float().clamp_min(1e-8)
++    scale = amax / 448.0
++    w_q = (w.float() / scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
++    return w_q.contiguous(), scale.squeeze(1).contiguous()
++
++
++def _get_fp8_weight(weight: torch.Tensor):
++    global _fp8w_cache_bytes
++    # data_ptr alone can be reused by the allocator after a free, and an
++    # in-place weight update (copy_) keeps the ptr; shape + _version make the
++    # key safe for both.
++    key = (weight.data_ptr(), weight.shape[0], weight.shape[1], weight._version)
++    hit = _fp8w_cache.get(key)
++    if hit is not None:
++        return hit
++    if torch.cuda.is_current_stream_capturing():
++        return None
++    if _fp8w_cache_bytes + weight.numel() + weight.shape[0] * 4 > _FP8W_CACHE_MAX_BYTES:
++        return None
++    entry = _quantize_rowwise_fp8(weight)
++    _fp8w_cache[key] = entry
++    _fp8w_cache_bytes += entry[0].numel() + entry[1].numel() * 4
++    return entry
++
++
+ def _generic_tactic(m: int, n: int, k: int) -> tuple[int, int, int, int, int]:
+-    """(1, 16, 128) measured best for the wide shapes (81% of DRAM bandwidth
+-    at m=4, n=4120, k=2560); split K only when 16-wide N tiles cannot fill
+-    the 188 sm120 SMs."""
+-    n_ctas = triton.cdiv(n, 16)
+-    split_k = 1
+-    while split_k < 16 and n_ctas * split_k < 128 and (k // (split_k * 2)) >= 256:
+-        split_k *= 2
+-    return (split_k, 16, 128, 4, 4)
++    """(1, 16, 128) measured best for the wide shapes (81-90% of DRAM
++    bandwidth at n>=2560). Split-K measured WORSE end-to-end on every real
++    shape here: the zero + atomic + fp32->bf16 epilogue costs more than the
++    extra CTAs gain (tune_mid 2026-08-31), so stay split-free."""
++    return (1, 16, 128, 4, 4)
++
++
++def _generic_tactic_fp8(m: int, n: int, k: int) -> tuple[int, int, int, int, int]:
++    """FP8 rows are half as wide, so 32-wide N tiles keep the loads
++    vectorized: (1, 32, 128) measured 89% of the fp8 floor at n=16480.
++    Split-free for the same epilogue-cost reason as the bf16 tactic."""
++    return (1, 32, 128, 4, 4)
+ 
+ 
+ def use_sm120_lowm_bf16_gemm(m: int, n: int, k: int) -> bool:
+     return m <= _MAX_M and _MIN_WEIGHT_BYTES <= n * k * 2 <= _MAX_WEIGHT_BYTES
+ 
+ 
++# Set by initialize_bf16_gemm_config from SGLANG_SM120_LOWM_FP8_WEIGHT.
++fp8_weight_enabled = False
++
++
+ def sm120_lowm_bf16_gemm(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+-    """out = x @ weight.T for bf16 x[m, k], weight[n, k]; bias-free, m <= 8."""
++    """out = x @ weight.T for bf16 x[m, k], weight[n, k]; bias-free, m <= 32."""
+     x_2d = x.view(-1, x.shape[-1])
+     m, k = x_2d.shape
+     n = weight.shape[0]
+-    tactic = _SM120_TUNED_TACTICS.get((m, n, k)) or _generic_tactic(m, n, k)
++
++    fp8_entry = (
++        _get_fp8_weight(weight)
++        if fp8_weight_enabled and n * k * 2 >= _FP8_MIN_WEIGHT_BYTES
++        else None
++    )
++    if fp8_entry is not None:
++        w_run, scale = fp8_entry
++        tactic = _generic_tactic_fp8(m, n, k)
++    else:
++        w_run, scale = weight, None
++        tactic = _SM120_TUNED_TACTICS.get((m, n, k)) or _generic_tactic(m, n, k)
+     split_k, block_n, block_k, num_warps, num_stages = tactic
+     block_m = max(16, triton.next_power_of_2(m))
+     grid = (triton.cdiv(n, block_n), split_k)
++
+     if split_k == 1:
+-        out = torch.empty((m, n), dtype=torch.bfloat16, device=x.device)
+-        _sm120_lowm_gemm_kernel[grid](
+-            x_2d,
+-            weight,
+-            out,
+-            m,
+-            n,
+-            k,
+-            x_2d.stride(0),
+-            x_2d.stride(1),
+-            weight.stride(0),
+-            weight.stride(1),
+-            out.stride(0),
+-            out.stride(1),
+-            BLOCK_N=block_n,
+-            BLOCK_K=block_k,
+-            BLOCK_M=block_m,
+-            SPLIT_K=1,
+-            NUM_STAGES=num_stages,
+-            OUT_BF16=True,
+-            num_warps=num_warps,
++        out_buf = torch.empty((m, n), dtype=torch.bfloat16, device=x.device)
++        out_bf16 = True
++    else:
++        out_buf = torch.zeros((m, n), dtype=torch.float32, device=x.device)
++        out_bf16 = False
++
++    common = dict(
++        BLOCK_N=block_n,
++        BLOCK_K=block_k,
++        BLOCK_M=block_m,
++        SPLIT_K=split_k,
++        NUM_STAGES=num_stages,
++        OUT_BF16=out_bf16,
++        num_warps=num_warps,
++    )
++    if scale is not None:
++        _sm120_lowm_gemm_fp8w_kernel[grid](
++            x_2d, w_run, scale, out_buf, m, n, k,
++            x_2d.stride(0), x_2d.stride(1),
++            w_run.stride(0), w_run.stride(1),
++            out_buf.stride(0), out_buf.stride(1),
++            **common,
+         )
+     else:
+-        acc = torch.zeros((m, n), dtype=torch.float32, device=x.device)
+         _sm120_lowm_gemm_kernel[grid](
+-            x_2d,
+-            weight,
+-            acc,
+-            m,
+-            n,
+-            k,
+-            x_2d.stride(0),
+-            x_2d.stride(1),
+-            weight.stride(0),
+-            weight.stride(1),
+-            acc.stride(0),
+-            acc.stride(1),
+-            BLOCK_N=block_n,
+-            BLOCK_K=block_k,
+-            BLOCK_M=block_m,
+-            SPLIT_K=split_k,
+-            NUM_STAGES=num_stages,
+-            OUT_BF16=False,
+-            num_warps=num_warps,
++            x_2d, w_run, out_buf, m, n, k,
++            x_2d.stride(0), x_2d.stride(1),
++            w_run.stride(0), w_run.stride(1),
++            out_buf.stride(0), out_buf.stride(1),
++            **common,
+         )
+-        out = acc.to(torch.bfloat16)
++    out = out_buf if out_bf16 else out_buf.to(torch.bfloat16)
+     return out.view(*x.shape[:-1], n)
+ 
+ 
+diff --git a/python/sglang/srt/environ.py b/python/sglang/srt/environ.py
+index ea42cc7..9a09ae8 100644
+--- a/python/sglang/srt/environ.py
++++ b/python/sglang/srt/environ.py
+@@ -963,6 +963,10 @@ class Envs:
+     # SM120 GPUs, where cuBLAS picks ~20-70%-of-bandwidth WMMA kernels and the
+     # SM100 CuTe DSL/split-K paths cannot run (tcgen05).
+     SGLANG_ENABLE_SM120_LOWM_BF16_GEMM = EnvBool(True)
++    # Serve the sm120 low-M path from a per-row-scaled FP8 copy of each
++    # eligible bf16 weight (W8A16): halves decode-path weight reads at the
++    # cost of extra VRAM for the FP8 copies. Weight-only, no activation quant.
++    SGLANG_SM120_LOWM_FP8_WEIGHT = EnvBool(False)
+     # Route decode-size HC mix through the fused CuTe split-K GEMM pair
+     # instead of the persistent Triton mix.
+     SGLANG_HC_MIX_CUDA = EnvBool(True)
+diff --git a/python/sglang/srt/layers/quantization/unquant.py b/python/sglang/srt/layers/quantization/unquant.py
+index 57ced60..1295a12 100644
+--- a/python/sglang/srt/layers/quantization/unquant.py
++++ b/python/sglang/srt/layers/quantization/unquant.py
+@@ -207,6 +207,7 @@ def initialize_bf16_gemm_config(server_args: ServerArgs) -> None:
+         and torch.cuda.get_device_capability() == (12, 0)
+         and not server_args.enable_deterministic_inference
+     ):
++        import sglang.kernels.ops.gemm.sm120_lowm_bf16_gemm as _sm120_mod
+         from sglang.kernels.ops.gemm.sm120_lowm_bf16_gemm import (
+             sm120_lowm_bf16_gemm,
+             use_sm120_lowm_bf16_gemm,
+@@ -215,7 +216,11 @@ def initialize_bf16_gemm_config(server_args: ServerArgs) -> None:
+         _sm120_lowm_bf16_gemm = sm120_lowm_bf16_gemm
+         _use_sm120_lowm_bf16_gemm = use_sm120_lowm_bf16_gemm
+         _enable_sm120_lowm_bf16_gemm = True
+-        logger.info("SM120 low-M BF16 GEMM path enabled")
++        _sm120_mod.fp8_weight_enabled = envs.SGLANG_SM120_LOWM_FP8_WEIGHT.get()
++        logger.info(
++            "SM120 low-M BF16 GEMM path enabled (fp8 weight-only: %s)",
++            _sm120_mod.fp8_weight_enabled,
++        )
+ 
+     _BF16_GEMM_BACKEND = backend
+ 
+-- 
+2.43.0
+

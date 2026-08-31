@@ -1,0 +1,256 @@
+From 85e7da1f87cc323d9d5ff1e9f7297055ecf26268 Mon Sep 17 00:00:00 2001
+From: gabrielolympie <gab.olympie@gmail.com>
+Date: Mon, 31 Aug 2026 01:37:26 +0200
+Subject: [PATCH 3/3] sm120: fp8 weight-only for HC mix and decode-size lm_head
+
+HC mix persistent kernel gains an FP8W path (per-row scales applied after
+each dot): 14.5 -> 10.8 us/mix. lm_head decode logits route through the fp8
+GEMV when SGLANG_SM120_LM_HEAD_FP8 is set (chunked rowwise quantization: a
+full-tensor fp32 temp of the 1.27 GB lm_head OOMs a 0.96-mem-fraction
+server). The fp8 lm_head also halves every MTP draft step's logits GEMV.
+
+C1 greedy median 163.5 -> 188.8 (best 193.3), C4 477 -> 529. Accept length
+unchanged (2.2-2.5); greedy/needles/5x GSM spot checks all pass.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ .../kernels/ops/gemm/sm120_lowm_bf16_gemm.py  | 51 +++++++++++++++++--
+ python/sglang/srt/environ.py                  |  4 ++
+ python/sglang/srt/layers/hc_mix_triton.py     | 42 ++++++++++++++-
+ python/sglang/srt/layers/logits_processor.py  | 16 ++++--
+ .../sglang/srt/layers/quantization/unquant.py |  4 +-
+ 5 files changed, 107 insertions(+), 10 deletions(-)
+
+diff --git a/python/sglang/kernels/ops/gemm/sm120_lowm_bf16_gemm.py b/python/sglang/kernels/ops/gemm/sm120_lowm_bf16_gemm.py
+index c27cda2..471d57b 100644
+--- a/python/sglang/kernels/ops/gemm/sm120_lowm_bf16_gemm.py
++++ b/python/sglang/kernels/ops/gemm/sm120_lowm_bf16_gemm.py
+@@ -173,10 +173,19 @@ _FP8W_CACHE_MAX_BYTES = 6 * 1024**3
+ 
+ 
+ def _quantize_rowwise_fp8(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+-    amax = w.abs().amax(dim=1, keepdim=True).float().clamp_min(1e-8)
+-    scale = amax / 448.0
+-    w_q = (w.float() / scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+-    return w_q.contiguous(), scale.squeeze(1).contiguous()
++    n = w.shape[0]
++    w_q = torch.empty_like(w, dtype=torch.float8_e4m3fn)
++    scale = torch.empty(n, dtype=torch.float32, device=w.device)
++    # Chunk rows: a full-tensor fp32 temp of the 1.27 GB lm_head would need
++    # ~5 GB that a 0.96-mem-fraction server does not have.
++    step = max(1, (64 * 1024 * 1024) // max(1, w.shape[1] * 4))
++    for i in range(0, n, step):
++        blk = w[i : i + step].float()
++        amax = blk.abs().amax(dim=1, keepdim=True).clamp_min(1e-8)
++        s = amax / 448.0
++        w_q[i : i + step] = (blk / s).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
++        scale[i : i + step] = s.squeeze(1)
++    return w_q, scale
+ 
+ 
+ def _get_fp8_weight(weight: torch.Tensor):
+@@ -278,6 +287,40 @@ def sm120_lowm_bf16_gemm(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+     return out.view(*x.shape[:-1], n)
+ 
+ 
++# Set by initialize_bf16_gemm_config from SGLANG_SM120_LM_HEAD_FP8.
++lm_head_fp8_enabled = False
++
++
++def maybe_sm120_fp8_lm_head(
++    hidden_states: torch.Tensor, weight: torch.Tensor
++) -> Optional[torch.Tensor]:
++    """FP8 weight-only lm_head GEMV for decode-size row counts, or None to
++    let the caller keep the cuBLAS bf16 path (which runs at ~94% of DRAM
++    bandwidth but reads 2x the bytes)."""
++    if not (lm_head_fp8_enabled and fp8_weight_enabled):
++        return None
++    if hidden_states.dim() != 2 or hidden_states.shape[0] > _MAX_M:
++        return None
++    if hidden_states.dtype != torch.bfloat16 or weight.dtype != torch.bfloat16:
++        return None
++    entry = _get_fp8_weight(weight)
++    if entry is None:
++        return None
++    w_q, scale = entry
++    m, k = hidden_states.shape
++    n = w_q.shape[0]
++    out = torch.empty((m, n), dtype=torch.bfloat16, device=hidden_states.device)
++    _sm120_lowm_gemm_fp8w_kernel[(triton.cdiv(n, 32), 1)](
++        hidden_states, w_q, scale, out, m, n, k,
++        hidden_states.stride(0), hidden_states.stride(1),
++        w_q.stride(0), w_q.stride(1),
++        out.stride(0), out.stride(1),
++        BLOCK_N=32, BLOCK_K=128, BLOCK_M=max(16, triton.next_power_of_2(m)),
++        SPLIT_K=1, NUM_STAGES=4, OUT_BF16=True, num_warps=4,
++    )
++    return out
++
++
+ def precompile_sm120_lowm_tactics(device: Optional[torch.device] = None) -> None:
+     """JIT-compile the tuned specializations before CUDA graph capture."""
+     for m, n, k in _SM120_TUNED_TACTICS:
+diff --git a/python/sglang/srt/environ.py b/python/sglang/srt/environ.py
+index 9a09ae8..fa2eec5 100644
+--- a/python/sglang/srt/environ.py
++++ b/python/sglang/srt/environ.py
+@@ -967,6 +967,10 @@ class Envs:
+     # eligible bf16 weight (W8A16): halves decode-path weight reads at the
+     # cost of extra VRAM for the FP8 copies. Weight-only, no activation quant.
+     SGLANG_SM120_LOWM_FP8_WEIGHT = EnvBool(False)
++    # Also serve decode-size lm_head logits from an FP8 weight copy (needs
++    # SGLANG_SM120_LOWM_FP8_WEIGHT). Separate switch: logit noise directly
++    # affects sampling and MTP acceptance.
++    SGLANG_SM120_LM_HEAD_FP8 = EnvBool(False)
+     # Route decode-size HC mix through the fused CuTe split-K GEMM pair
+     # instead of the persistent Triton mix.
+     SGLANG_HC_MIX_CUDA = EnvBool(True)
+diff --git a/python/sglang/srt/layers/hc_mix_triton.py b/python/sglang/srt/layers/hc_mix_triton.py
+index 734ad2f..41099d6 100644
+--- a/python/sglang/srt/layers/hc_mix_triton.py
++++ b/python/sglang/srt/layers/hc_mix_triton.py
+@@ -48,6 +48,8 @@ def _hc_mix_persistent_kernel(
+     t_raw_ptr,
+     out_ptr,
+     counters_ptr,
++    s_down_ptr,
++    s_up_ptr,
+     K,
+     LOWRANK,
+     HS,
+@@ -60,6 +62,7 @@ def _hc_mix_persistent_kernel(
+     BLOCK_K: tl.constexpr,
+     BLOCK_J: tl.constexpr,
+     BLOCK_R: tl.constexpr,
++    FP8W: tl.constexpr,
+ ):
+     pid = tl.program_id(0)
+     offs_m = tl.arange(0, ROWS)
+@@ -92,7 +95,12 @@ def _hc_mix_persistent_kernel(
+             mask=mask_n[:, None],
+             other=0.0,
+         )
++        if FP8W:
++            w = w.to(x_ptr.dtype.element_ty)
+         acc = tl.dot(xt, tl.trans(w))
++        if FP8W:
++            s = tl.load(s_down_ptr + n, mask=mask_n, other=0.0)
++            acc = acc * s[None, :]
+         tl.atomic_add(
+             t_raw_ptr + offs_m[:, None] * LOWRANK + n[None, :],
+             acc,
+@@ -130,7 +138,12 @@ def _hc_mix_persistent_kernel(
+                 mask=mask_gj[:, None] & mask_r[None, :],
+                 other=0.0,
+             )
++            if FP8W:
++                w = w.to(x_ptr.dtype.element_ty)
+             acc = tl.dot(t, tl.trans(w), acc)
++        if FP8W:
++            s_up = tl.load(s_up_ptr + gj_flat, mask=mask_gj, other=0.0)
++            acc = acc * s_up[None, :]
+         gate = tl.sigmoid(tl.reshape(acc, (ROWS, HC, BLOCK_J)))
+         xg = tl.load(
+             x_ptr
+@@ -203,6 +216,22 @@ def fused_hc_mix_supported(
+     )
+ 
+ 
++def _maybe_fp8_weights(w_down: torch.Tensor, w_up: torch.Tensor):
++    """Serve the mix from per-row-scaled fp8 copies when the sm120 weight-only
++    path is on (halves the ~14 MB of weight reads per mix)."""
++    try:
++        from sglang.kernels.ops.gemm import sm120_lowm_bf16_gemm as _gemm_mod
++    except ImportError:
++        return None
++    if not _gemm_mod.fp8_weight_enabled:
++        return None
++    down = _gemm_mod._get_fp8_weight(w_down)
++    up = _gemm_mod._get_fp8_weight(w_up)
++    if down is None or up is None:
++        return None
++    return down, up
++
++
+ def fused_hc_mix(
+     hyper_input_normed: torch.Tensor,
+     w_down: torch.Tensor,
+@@ -219,13 +248,21 @@ def fused_hc_mix(
+     out = torch.empty((rows, hs), dtype=hyper_input_normed.dtype, device=device)
+     if rows == 0:
+         return out
++    fp8 = _maybe_fp8_weights(w_down, w_up)
++    if fp8 is not None:
++        (w_down_run, s_down), (w_up_run, s_up) = fp8
++    else:
++        w_down_run, s_down = w_down, w_down  # dummy ptrs, unused when FP8W=False
++        w_up_run, s_up = w_up, w_up
+     _hc_mix_persistent_kernel[(num_ctas,)](
+         hyper_input_normed,
+-        w_down,
+-        w_up,
++        w_down_run,
++        w_up_run,
+         t_raw,
+         out,
+         _get_counters(device),
++        s_down,
++        s_up,
+         k,
+         lowrank,
+         hs,
+@@ -238,6 +275,7 @@ def fused_hc_mix(
+         BLOCK_K=256,
+         BLOCK_J=32,
+         BLOCK_R=64,
++        FP8W=fp8 is not None,
+         num_warps=8,
+     )
+     return out
+diff --git a/python/sglang/srt/layers/logits_processor.py b/python/sglang/srt/layers/logits_processor.py
+index 7cea446..b0c704e 100644
+--- a/python/sglang/srt/layers/logits_processor.py
++++ b/python/sglang/srt/layers/logits_processor.py
+@@ -737,9 +737,19 @@ class LogitsProcessor(nn.Module):
+                     hidden_states.bfloat16(), lm_head.weight.T.bfloat16()
+                 )
+             else:
+-                logits = torch.matmul(
+-                    hidden_states.to(lm_head.weight.dtype), lm_head.weight.T
+-                )
++                logits = None
++                if lm_head.weight.is_cuda and lm_head.weight.dtype == torch.bfloat16:
++                    from sglang.kernels.ops.gemm.sm120_lowm_bf16_gemm import (
++                        maybe_sm120_fp8_lm_head,
++                    )
++
++                    logits = maybe_sm120_fp8_lm_head(
++                        hidden_states.to(lm_head.weight.dtype), lm_head.weight
++                    )
++                if logits is None:
++                    logits = torch.matmul(
++                        hidden_states.to(lm_head.weight.dtype), lm_head.weight.T
++                    )
+         else:
+             # GGUF models
+             # TODO: use weight_packed_linear for GGUF models
+diff --git a/python/sglang/srt/layers/quantization/unquant.py b/python/sglang/srt/layers/quantization/unquant.py
+index 1295a12..cdf2735 100644
+--- a/python/sglang/srt/layers/quantization/unquant.py
++++ b/python/sglang/srt/layers/quantization/unquant.py
+@@ -217,9 +217,11 @@ def initialize_bf16_gemm_config(server_args: ServerArgs) -> None:
+         _use_sm120_lowm_bf16_gemm = use_sm120_lowm_bf16_gemm
+         _enable_sm120_lowm_bf16_gemm = True
+         _sm120_mod.fp8_weight_enabled = envs.SGLANG_SM120_LOWM_FP8_WEIGHT.get()
++        _sm120_mod.lm_head_fp8_enabled = envs.SGLANG_SM120_LM_HEAD_FP8.get()
+         logger.info(
+-            "SM120 low-M BF16 GEMM path enabled (fp8 weight-only: %s)",
++            "SM120 low-M BF16 GEMM path enabled (fp8 weight-only: %s, lm_head fp8: %s)",
+             _sm120_mod.fp8_weight_enabled,
++            _sm120_mod.lm_head_fp8_enabled,
+         )
+ 
+     _BF16_GEMM_BACKEND = backend
+-- 
+2.43.0
+
