@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # BEST VALIDATED CONFIG (2026-08-30) — Qwen3.8-Flash-Next NVFP4, TP1, RTX PRO 6000 Blackwell (sm120).
-# Measured (2026-08-31 8h-run, temp0.6 warm): C1 231.5 median/233.8 best tok/s, C4 621 agg, C8 ~740 agg, prefill ~10.4K, TTFT ~135ms.
+# TWO PROFILES: this one = max-throughput interactive (4-way, fp8, 262144 ctx, C1 ~231 tok/s).
+# For one huge session (786,432-token context, ~827K KV pool, C1 ~185): ./serve_single.sh
 # BEATS jpezzulli (171/428) on the OFFICIAL branch + sm120-wy commits 086a37f+284d7fe (Triton low-M GEMM + fp8 weight-only).
 # + patches/0002 (FP8 QSA dequant) + patches/0003 (sm120 fp32 prefill state). See patches/README.md.
 #
@@ -20,14 +21,14 @@ done
 mkdir -p logs; rm -f logs/serve.log
 systemd-run --user --unit=qwen-sglang \
   --property=MemoryMax=112G --property=MemorySwapMax=0 \
-  --setenv=MEMFRAC=0.95 --setenv=CTX="${CTX:-131072}" --setenv=MAXREQ=8 \
+  --setenv=MEMFRAC=0.95 --setenv=CTX="${CTX:-262144}" --setenv=MAXREQ=4 \
   --setenv=LINEAR_BACKEND=flashinfer --setenv=SSM_DTYPE=bfloat16 --setenv=MAMBA_RADIX=extra_buffer \
   --setenv=KVDTYPE=fp8_e4m3 --setenv=SPEC=1 --setenv=HICACHE=0 \
   --setenv=GDN_MTP_CACHE_MODE=none \
   --setenv=SGLANG_SM120_LOWM_FP8_WEIGHT=1 \
   --setenv=SGLANG_SM120_LM_HEAD_FP8=1 \
-  --setenv=CUDAGRAPH_MAXBS=8 --setenv=CPU_OFFLOAD_GB=0 \
-  --setenv=MAMBA_CACHE=48 \
+  --setenv=CUDAGRAPH_MAXBS=4 --setenv=CPU_OFFLOAD_GB=0 \
+  --setenv=MAMBA_CACHE=24 \
   --setenv=AUTOTUNE=1 --setenv=MAX_JOBS=4 --setenv=FLASHINFER_NINJA_JOBS=4 --setenv=FLASHINFER_NVCC_THREADS=2 \
   --working-directory=/home/golympie/ai-toolbox/models/qwen38fn \
   -- bash -c 'exec bash serve.sh > logs/serve.log 2>&1'

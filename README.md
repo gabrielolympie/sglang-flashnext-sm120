@@ -16,7 +16,16 @@ then goes ~35-45% past its published numbers.
 | Decode, 8 streams | — | **758** | |
 | Prefill (2.5K) | 10–12K | ~10.4K tok/s | |
 | TTFT | — | ~135 ms | |
-| Context | 32K (524K w/ YaRN) | **262144** (full native window, no speed cost) | |
+
+Two launch profiles:
+
+| profile | context window | KV pool | decode C1 |
+|---|---|---|---|
+| `serve_best.sh` — interactive + agents (4-way) | 262144 (native) | ~450K tokens | **231 tok/s** |
+| `serve_single.sh` — one huge session | **786432** (YaRN ×3) | **~827K tokens** | 185 tok/s |
+
+The long-context profile trades the fp8 dense-weight copies back for KV head-room and is
+validated with needle retrieval at 653K-token depth (start / middle / end all pass).
 
 Validated with greedy/needle/cached-prefix/GSM/code gates and 2.4M tokens of soak testing
 (0 errors, flat VRAM/RAM).
@@ -25,7 +34,8 @@ Validated with greedy/needle/cached-prefix/GSM/code gates and 2.4M tokens of soa
 
 ```
 patches/            six patches against sgl-project/sglang @ qwen4-main-squashed
-scripts/            serve.sh (knobbed launcher) · serve_best.sh · bench · hot-token map gen
+scripts/            serve.sh (knobbed launcher) · serve_best.sh · serve_single.sh (786K ctx)
+                    bench_sglang.py · make_hot_tokens.py · do_build.sh
 docs/               STATUS.md (ops guide) · PERF_CEILING.md (analysis + dead-ends)
 results/            benchmark JSONs, baseline -> final
 hot_tokens_64k.pt   FR-Spec draft-vocab map

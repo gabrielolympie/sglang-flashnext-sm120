@@ -87,6 +87,11 @@ SPEC_TOKEN_MAP="${SPEC_TOKEN_MAP:-/home/golympie/ai-toolbox/models/qwen38fn/hot_
 [[ "$HICACHE" == "1" ]] && args+=( --enable-hierarchical-cache --hicache-size 32
   --hicache-host-memory-mode cache --hicache-write-policy write_through --hicache-io-backend kernel )
 
+# Long-context YaRN rope override (factor = CTX/262144 for CTX beyond the native window).
+# Fields mirror the checkpoint's rope_parameters with rope_type default->yarn (jpezzulli ran
+# factor 2.0 = 524288; the 800K single-session profile uses 3.0 = 786432).
+[[ -n "${ROPE_OVERRIDE:-}" ]] && args+=( --json-model-override-args "$ROPE_OVERRIDE" )
+
 # Extra CLI args (e.g. from `omega --serve <key> [args...]`) are appended last; argparse last-wins
 # so they can override anything above (--port, --served-model-name, --context-length, ...).
 echo "sglang ${args[*]} $*"
