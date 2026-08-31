@@ -52,6 +52,11 @@ hot_tokens_64k.pt   FR-Spec draft-vocab map
 ## Reproduce
 
 ```bash
+# model checkpoint (~135 GB; the ~50 GB PLE n-gram table is served from host RAM)
+hf download RadixArk/Qwen3.8-Flash-Next-NVFP4 --local-dir Qwen3.8-Flash-Next-NVFP4
+# note: hf_xet can stall on the largest shards; scripts/serve.sh's docs and
+# docs/STATUS.md describe the curl fallback that resumes reliably.
+
 git clone -b qwen4-main-squashed https://github.com/sgl-project/sglang sglang-official
 cd sglang-official && bash ../scripts/do_build.sh
 git apply ../patches/0002-fp8-qsa-tile-dequant.patch --exclude='test/*'
