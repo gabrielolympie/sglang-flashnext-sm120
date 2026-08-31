@@ -16,6 +16,7 @@ then goes ~35-45% past its published numbers.
 | Decode, 8 streams | — | **758** | |
 | Prefill (2.5K) | 10–12K | ~10.4K tok/s | |
 | TTFT | — | ~135 ms | |
+| Context | 32K (524K w/ YaRN) | **262144** (full native window, no speed cost) | |
 
 Validated with greedy/needle/cached-prefix/GSM/code gates and 2.4M tokens of soak testing
 (0 errors, flat VRAM/RAM).

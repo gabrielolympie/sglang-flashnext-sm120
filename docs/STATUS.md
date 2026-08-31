@@ -15,7 +15,7 @@ Official sglang `qwen4-main-squashed` branch + local commits on `sm120-wy` (see 
 | 16K-context decode | — | ~265 tok/s (no degradation) | |
 | 20-min soak + 60-min burn-in | — | 2.38M toks total, 0 errors, VRAM/RAM flat | |
 | MTP accept length | 2.58 | 2.5-3.0 (relaxed 0.3) | 2.1-2.2 |
-Context: 131072 default (KV pool ~411K fp8 tokens is VRAM-bound — same pool as 32K, same speed).
+Context: 262144 default — the full native window, same KV pool (~406K fp8 tokens) and same speed as 32K. 151K-token needles pass at start/middle/end depths.
 76K-needle stress: edges + most middle depths retrieve; occasional middle-depth misses are
 model/QSA-inherent (reproduced with bf16 KV — not our fp8).
 Correctness gates (all PASS, final build): greedy arithmetic/fact · 3× needles in 7.3K prompt ·
@@ -52,7 +52,7 @@ default → tokens in `delta.reasoning_content`). Or from the laptop: `omega --u
 ## Knobs (env → serve.sh)
 `SPEC_ACCEPT_SINGLE/ACC` (0.3; 1.0 = lossless) · `SPEC_TOKEN_MAP` (path or `none`) ·
 `SGLANG_SM120_LOWM_FP8_WEIGHT` / `SGLANG_SM120_LM_HEAD_FP8` (fp8 off ⇒ pure-bf16 kernels) ·
-`MAXREQ/CUDAGRAPH_MAXBS/MAMBA_CACHE` (8/8/48) · `MEMFRAC` (0.95) · `CTX` (131072; native 262144) ·
+`MAXREQ/CUDAGRAPH_MAXBS/MAMBA_CACHE` (8/8/48) · `MEMFRAC` (0.95) · `CTX` (262144 = full native window) ·
 `KVDTYPE=fp8_e4m3` · `LINEAR_BACKEND=flashinfer` · `GDN_MTP_CACHE_MODE=none` (WY/RecoverSSM).
 
 ## Engine patches (branch `sm120-wy` @ ../sglang-official)
