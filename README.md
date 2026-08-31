@@ -13,7 +13,7 @@ then goes ~35-45% past its published numbers.
 |---|---|---|---|
 | Decode, 1 stream | 171 tok/s | **231 median / 243 best** | 203 |
 | Decode, 4 streams | 428 | **620–657** | 549 |
-| Decode, 8 streams | — | **758** | |
+| Decode, 8 streams (optional 8-way config) | — | 758 | |
 | Prefill (2.5K) | 10–12K | ~10.4K tok/s | |
 | TTFT | — | ~135 ms | |
 
@@ -21,7 +21,7 @@ Two launch profiles:
 
 | profile | context window | KV pool | decode C1 |
 |---|---|---|---|
-| `serve_best.sh` — interactive + agents (4-way) | 262144 (native) | ~450K tokens | **231 tok/s** |
+| `serve_best.sh` — interactive + agents (4-way) | 262144 (native) | ~572K tokens | **231 tok/s** |
 | `serve_single.sh` — one huge session | **786432** (YaRN ×3) | **~827K tokens** | 185 tok/s |
 
 The long-context profile trades the fp8 dense-weight copies back for KV head-room and is

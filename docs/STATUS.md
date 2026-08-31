@@ -9,7 +9,7 @@ Official sglang `qwen4-main-squashed` branch + local commits on `sm120-wy` (see 
 |---|---|---|---|
 | Decode C1 | 171 tok/s | **231.0 median / 234.6 best** | 202.9 / 205.0 |
 | Decode C4 aggregate | 428 | **620 / 628.7** | 549 / 560 |
-| Decode C8 aggregate | — | **758** | |
+| Decode C8 aggregate (opt. 8-way variant) | — | 758 | |
 | Prefill (2.5K) | ~10-12K | ~10.4K tok/s (17.8K cached) | |
 | TTFT | — | ~139 ms | |
 | 16K-context decode | — | ~265 tok/s (no degradation) | |
@@ -21,13 +21,19 @@ model/QSA-inherent (reproduced with bf16 KV — not our fp8).
 Correctness gates (all PASS, final build): greedy arithmetic/fact · 3× needles in 7.3K prompt ·
 cached-prefix identical · 5-8× GSM-style @0.6 · code spot · French. VRAM peak 95.5 GB.
 
-## Run
+## Run — two profiles (same unit `qwen-sglang`, same endpoint; one command to switch)
 ```bash
-./serve_best.sh                         # persistent user service `qwen-sglang`, ready in ~5 min
-curl -s http://127.0.0.1:8001/health    # 200 when ready
+./serve_best.sh      # DEFAULT: interactive + agents. 4-way, fp8 stack on,
+                     # ctx 262144 (native), KV pool ~572K tokens, C1 ~231 tok/s.
+./serve_single.sh    # ONE HUGE SESSION: ctx 786432 (YaRN x3), KV pool ~827K tokens,
+                     # C1 ~185 tok/s (fp8 dense copies traded for KV head-room).
+curl -s http://127.0.0.1:8001/health    # 200 when ready (~5 min)
 systemctl --user stop qwen-sglang       # stop
-tail -f logs/serve.log
 ```
+The 786K profile is validated with needle retrieval at 653K-token depth (start/middle/end
+all pass); 653K prefill ~89 s cold, ~4 s on cached prefixes. ~827K tokens is the physical
+ceiling of the card (81.5 GB weights on 96 GB). An 8-way variant of the default profile
+(`MAXREQ=8 CUDAGRAPH_MAXBS=8 MAMBA_CACHE=48`) measured 758 tok/s aggregate if ever needed.
 Endpoint **http://localhost:8001/v1**, model **`pennyroyal`** (OpenAI-compatible; thinking on by
 default → tokens in `delta.reasoning_content`). Or from the laptop: `omega --update` then
 `omega --serve qwen3.8-flash-next`.
@@ -52,7 +58,7 @@ default → tokens in `delta.reasoning_content`). Or from the laptop: `omega --u
 ## Knobs (env → serve.sh)
 `SPEC_ACCEPT_SINGLE/ACC` (0.3; 1.0 = lossless) · `SPEC_TOKEN_MAP` (path or `none`) ·
 `SGLANG_SM120_LOWM_FP8_WEIGHT` / `SGLANG_SM120_LM_HEAD_FP8` (fp8 off ⇒ pure-bf16 kernels) ·
-`MAXREQ/CUDAGRAPH_MAXBS/MAMBA_CACHE` (8/8/48) · `MEMFRAC` (0.95) · `CTX` (262144 = full native window) ·
+`MAXREQ/CUDAGRAPH_MAXBS/MAMBA_CACHE` (4/4/24; mamba ~6x MAXREQ) · `MEMFRAC` (0.95) · `CTX` (262144 = full native window) ·
 `KVDTYPE=fp8_e4m3` · `LINEAR_BACKEND=flashinfer` · `GDN_MTP_CACHE_MODE=none` (WY/RecoverSSM).
 
 ## Engine patches (branch `sm120-wy` @ ../sglang-official)
